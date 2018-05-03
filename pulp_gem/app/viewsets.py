@@ -1,9 +1,16 @@
+import os
+import hashlib
+
 from gettext import gettext as _
 
+from django.db import transaction
 from django_filters.rest_framework import filterset
 from rest_framework.decorators import detail_route
-from rest_framework import serializers
+from rest_framework import serializers, status
+from rest_framework.response import Response
 
+from pulpcore.app.files import PulpTemporaryUploadedFile
+from pulpcore.plugin.models import Artifact, ContentArtifact
 from pulpcore.plugin.serializers import (
     RepositoryPublishURLSerializer,
     RepositorySyncURLSerializer,
@@ -19,6 +26,7 @@ from pulpcore.plugin.viewsets import (
 from . import tasks
 from .models import GemContent, GemRemote, GemPublisher
 from .serializers import GemContentSerializer, GemRemoteSerializer, GemPublisherSerializer
+from ..specs import analyse_gem
 
 
 class GemContentFilter(filterset.FilterSet):
@@ -30,11 +38,55 @@ class GemContentFilter(filterset.FilterSet):
         ]
 
 
+def artifact_from_data(raw_data):
+    tmpfile = PulpTemporaryUploadedFile("", "application/octet-stream", len(raw_data), "", "")
+    tmpfile.write(raw_data)
+    for hasher in Artifact.DIGEST_FIELDS:
+        tmpfile.hashers[hasher].update(raw_data)
+
+    artifact = Artifact()
+    artifact.file = tmpfile
+    artifact.size = tmpfile.size
+    for hasher in Artifact.DIGEST_FIELDS:
+        setattr(artifact, hasher, tmpfile.hashers[hasher].hexdigest())
+
+    artifact.save()
+    return artifact
+
+
 class GemContentViewSet(ContentViewSet):
     endpoint_name = 'gem/gems'
     queryset = GemContent.objects.all()
     serializer_class = GemContentSerializer
     filter_class = GemContentFilter
+
+    @transaction.atomic
+    def create(self, request):
+        data = request.data
+        try:
+            artifact = self.get_resource(data.pop('artifact'), Artifact)
+        except KeyError:
+            raise serializers.ValidationError(detail={'artifact': _('This field is required')})
+
+        name, version, spec_data = analyse_gem(artifact.file.name)
+        data['name'] = name
+        data['version'] = version
+
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        content = serializer.save()
+
+        relative_path = os.path.join('gems', name + '-' + version + '.gem')
+        spec_relative_path = os.path.join('quick/Marshal.4.8', name + '-' + version + '.gemspec.rz')
+        ContentArtifact(artifact=artifact,
+                        content=content,
+                        relative_path=relative_path).save()
+        ContentArtifact(artifact=artifact_from_data(spec_data),
+                        content=content,
+                        relative_path=spec_relative_path).save()
+
+        headers = self.get_success_headers(request.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
 
 class GemRemoteViewSet(RemoteViewSet):
